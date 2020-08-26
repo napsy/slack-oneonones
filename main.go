@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -18,6 +19,9 @@ import (
 	"google.golang.org/api/calendar/v3"
 	"mvdan.cc/xurls"
 )
+
+var scheduledEvents map[string]bool
+var l sync.Mutex
 
 // Retrieve a token, saves the token, then returns the generated client.
 func getClient(config *oauth2.Config) *http.Client {
@@ -75,7 +79,7 @@ func saveToken(path string, token *oauth2.Token) {
 }
 
 func slackNotify(source string, organizer string, email string, doc string) error {
-	text := "Hey there! You have a scheduled one-on-one meeting with %s in 30 minutes. The agenda for the meeting is:\n• check-in\n• your past five days of work (successes, blockers, ...)\n• teamwork\n• company\n• anything else on your mind?\n\nPlease check out your one-on-one document at %s before attending the meeting.\n\nMeeting link: %s\n\nSee you soon :)"
+	text := "Hey there! You have a scheduled one-on-one meeting with %s in 15 minutes. The agenda for the meeting is:\n• check-in\n• your past five days of work (successes, blockers, ...)\n• teamwork\n• company\n• anything else on your mind?\n\nPlease check out your one-on-one document at %s before attending the meeting.\n\nMeeting link: %s\n\nSee you soon :)"
 
 	api := slack.New(os.Getenv("SLACK_TOKEN"))
 	users, err := api.GetUsers()
@@ -85,7 +89,7 @@ func slackNotify(source string, organizer string, email string, doc string) erro
 	idx := strings.Index(email, "@")
 	email = email[:idx]
 	for _, user := range users {
-		if strings.Contains(user.Name, email) {
+		if strings.Contains(user.Name, email) || strings.Contains(user.Profile.Email, email) {
 			fmt.Printf("notifying %q ...\n", user.Name)
 			_, _, err := api.PostMessage(user.ID, slack.MsgOptionText(fmt.Sprintf(text, organizer, doc, source), true))
 			if err != nil {
@@ -103,13 +107,21 @@ func handleOneOnOne(organizer string, item *calendar.Event) {
 	}
 	idate, err := time.Parse(time.RFC3339, date)
 	if err != nil {
+		fmt.Printf("Error handling time: %v\n", err)
 		return
 	}
-	d := idate.Sub(time.Now())
-	// Notify about events that are scheduled in next 30 to 25 minutes. We take into
-	// account that we'll run periodically every 10 minutes.
-	if d > 30*time.Minute || d < 25*time.Minute {
+	l.Lock()
+	scheduled := scheduledEvents[item.Id]
+	if scheduled {
+		l.Unlock()
 		return
+	}
+	scheduledEvents[item.Id] = true
+	l.Unlock()
+
+	docUrl := xurls.Strict().FindAllString(item.Description, 1)
+	if len(docUrl) == 0 {
+		docUrl = append(docUrl, "(no document available)")
 	}
 	source := item.HtmlLink
 	for _, attendee := range item.Attendees {
@@ -122,13 +134,29 @@ func handleOneOnOne(organizer string, item *calendar.Event) {
 		if attendee.ResponseStatus == "declined" {
 			continue
 		}
-		docUrl := xurls.Strict().FindAllString(item.Description, 1)
-		if len(docUrl) == 0 {
-			docUrl = append(docUrl, "(no document available)")
+		if strings.Contains(attendee.Email, "calendar.google.com") {
+			continue
 		}
-		if err := slackNotify(source, organizer, attendee.Email, docUrl[0]); err != nil {
-			fmt.Printf("Error notifying user %s: %v\n", attendee.Email, err)
-		}
+
+		go func(attendee *calendar.EventAttendee) {
+			defer func() {
+				l.Lock()
+				delete(scheduledEvents, item.Id)
+				l.Unlock()
+			}()
+			d := idate.Sub(time.Now())
+			if d < 0 {
+				return
+			}
+			fmt.Printf("(will notify user %v in %v)\n", attendee.Email, d)
+			if d > 15*time.Minute {
+				d -= 15 * time.Minute
+				time.Sleep(d)
+			}
+			if err := slackNotify(source, organizer, attendee.Email, docUrl[0]); err != nil {
+				fmt.Printf("Error notifying user %s: %v\n", attendee.Email, err)
+			}
+		}(attendee)
 	}
 }
 
@@ -139,6 +167,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("Unable to read client secret file: %v", err)
 	}
+
+	scheduledEvents = make(map[string]bool)
 
 	// If modifying these scopes, delete your previously saved token.json.
 	config, err := google.ConfigFromJSON(b, calendar.CalendarReadonlyScope)
@@ -152,20 +182,24 @@ func main() {
 		log.Fatalf("Unable to retrieve Calendar client: %v", err)
 	}
 
-	t := time.Now().Format(time.RFC3339)
-	events, err := srv.Events.List("primary").ShowDeleted(false).
-		SingleEvents(true).TimeMin(t).MaxResults(10).OrderBy("startTime").Do()
-	if err != nil {
-		log.Fatalf("Unable to retrieve next ten of the user's events: %v", err)
-	}
-	fmt.Println("Upcoming events:")
-	if len(events.Items) == 0 {
-		fmt.Println("No upcoming events found.")
-	} else {
-		for _, item := range events.Items {
-			if strings.Contains(item.Summary, "1:1") && item.Organizer.Email == *flagOrganizer {
-				handleOneOnOne(*flagOrganizer, item)
+	for {
+		t := time.Now().Format(time.RFC3339)
+		events, err := srv.Events.List("primary").ShowDeleted(false).
+			SingleEvents(true).TimeMin(t).MaxResults(10).OrderBy("startTime").Do()
+		if err != nil {
+			log.Fatalf("Unable to retrieve next ten of the user's events: %v", err)
+		}
+		fmt.Println("Upcoming events:")
+		if len(events.Items) == 0 {
+			fmt.Println("No upcoming events found.")
+		} else {
+			for _, item := range events.Items {
+				if strings.Contains(item.Summary, "1:1") && item.Organizer.Email == *flagOrganizer {
+					fmt.Printf("Got scheduled one on ones ...\n")
+					handleOneOnOne(*flagOrganizer, item)
+				}
 			}
 		}
+		time.Sleep(time.Hour)
 	}
 }
